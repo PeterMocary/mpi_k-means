@@ -18,36 +18,25 @@
 #define INPUT_FILE_NAME "numbers"
 #define K 4
 
-
-void print_byte_array(std::vector<uint8_t> array, std::string name) {
-    for (int i = 0; i<array.size(); i++) {
-	std::cout << unsigned(array[i]);
-	if (array.size() != i+1) {
-	    std::cout << ", ";
-	} else {
-	    std::cout << std::endl;
-	}
-    }
-}
-
-
 int main(int argc, char** argv) {
 
     MPI_Init(nullptr, nullptr);
-
-    int process_cnt, current_process_rank;
-    double kmeans_centers[K] = {0.0};
-    process_cnt = current_process_rank = -1;
-    std::vector<uint8_t> program_input;
-    std::vector<int> cluster_indexes;
-    int input_size = 0;
-
-    std::vector<bool> are_centers_same_as_old(K);
-    std::fill(are_centers_same_as_old.begin(), are_centers_same_as_old.end(), false);
-    bool process_are_centers_same_as_old[K] = {false};
-	
+    int process_cnt = -1;
+    int current_process_rank = -1;
     MPI_Comm_size(MPI_COMM_WORLD, &process_cnt);
     MPI_Comm_rank(MPI_COMM_WORLD, &current_process_rank);
+
+    int input_size = 0;
+    int current_min_distance_idx = -1;
+    double kmeans_centers[K] = {0.0};
+    std::vector<uint8_t> program_input;
+
+    // index represents the index of the number on the input and the value the index of the cluster that the number belongs to
+    std::vector<int> cluster_indexes(process_cnt);
+    // index represnets cluster and the value represents the sum of numbres assigned to the cluster
+    std::vector<int> cluster_sums(K); 
+    // index represents cluster and the value represents the count of numbres assignet to the cluster
+    std::vector<int> cluster_cnts(K); 
 
     if (current_process_rank == MPI_ROOT_RANK) {
 	FILE* input_handle = nullptr;
@@ -58,17 +47,14 @@ int main(int argc, char** argv) {
 	    return 1;
 	}
 
-	//read from file	
+	// read 8b numbers from the input file, but only the same amount as number of processes
 	input_handle = fopen(INPUT_FILE_NAME,"r");
 	int n, i;
-	for (i = 0; (i < MAX_LEN && ((n = fgetc(input_handle)) != EOF)); i++)
+	for (i = 0; (i < process_cnt && ((n = fgetc(input_handle)) != EOF)); i++)
 	    program_input.push_back(n);
 	fclose(input_handle);
 	input_size = program_input.size();
 
-	// TODO: remove DEBUG output
-	//print_byte_array(program_input, "Program input: ");
-	
 	if (input_size < MIN_LEN || input_size > MAX_LEN) {
 	    std::cerr << "[E]: Wrong input size!" << std::endl;
 	    return 1;
@@ -79,105 +65,71 @@ int main(int argc, char** argv) {
 	    return 1;
 	}
 
-	// initialize centers
+	// init centers - first K numbers from the input
 	for (int i = 0; i < K; i++) {
 	    kmeans_centers[i] = program_input[i];
 	}
-
-        // initialize reduce point for the root
-        // cluster_indexes is the place where are the indexes for each input
-        // number gathered from the processes - maps the index of cluster to the
-        // number from input based on the index in the vector since program_input
-	// and cluster_indexes are the same length
-        for (int i = 0; i < program_input.size(); i++) {
-	    cluster_indexes.push_back(0);
-	}
+	
+	// init root recv buffers
+	std::fill(cluster_indexes.begin(), cluster_indexes.end(), 0);
+	std::fill(cluster_cnts.begin(), cluster_cnts.end(), 0);
+	std::fill(cluster_sums.begin(), cluster_sums.end(), 0);
     }
     
-    uint8_t n_to_cassify;
-    MPI_Bcast(&input_size, 1, MPI_INT, MPI_ROOT_RANK, MPI_COMM_WORLD);
+    // Distribute the program input, one number for eacho process
+    uint8_t n_to_classify;
     MPI_Scatter(program_input.data(), 1, MPI_BYTE,
-		&n_to_cassify, 1, MPI_BYTE,
+		&n_to_classify, 1, MPI_BYTE,
 		MPI_ROOT_RANK, MPI_COMM_WORLD);
     
     bool end = false;
     while (!end) {
 
-	// TODO: REMOVE DEBUG OUTPUT
-	/*
-	std::cout << "Process" << current_process_rank << " centers_same_as_old: ";
-	for (int i = 0; i < K; i++) {
-	    std::cout << process_are_centers_same_as_old[i] << " ";
-	}
-	std::cout << std::endl;
-	*/
-
+	// Distrubyte current centers to each process
 	MPI_Bcast(kmeans_centers, K, MPI_DOUBLE, MPI_ROOT_RANK, MPI_COMM_WORLD);
 	
-	// TODO: REMOVE DEBUG OUTPUT
-	/*
-	std::cout << "Process " << current_process_rank << " centers: ";
-	for (int i = 0; i < K; i++) {
-	    std::cout << kmeans_centers[i]; 
-	    if (i+1<K) { std::cout << ", "; } else { std::cout << std::endl; } 
-	}
-	std::cout << "Process " << current_process_rank << " to classify: " << unsigned(n_to_cassify) << std::endl;
-	*/
-    
 	// Find the minimal distance from the centers
 	std::vector<double> distances;
 	for (int i = 0; i<K; i++) {
-	    distances.push_back(abs(kmeans_centers[i] - n_to_cassify));
+	    distances.push_back(abs(kmeans_centers[i] - n_to_classify));
 	}
-
 	std::vector<double>::iterator minimal_distance_it = std::min_element(distances.begin(), distances.end());
-	int minimal_distance_index = std::distance(distances.begin(), minimal_distance_it); 
-    
-	std::vector<int> process_cluster_indexes(input_size);
-	std::fill(process_cluster_indexes.begin(), process_cluster_indexes.end(), 0);
-	process_cluster_indexes[current_process_rank] = minimal_distance_index;
+	current_min_distance_idx = std::distance(distances.begin(), minimal_distance_it); 
 	
-	MPI_Reduce(process_cluster_indexes.data(), cluster_indexes.data(), process_cluster_indexes.size(), 
+	// Sum of the index masks produces vector of amounts of numbers in each cluster
+	std::vector<int> process_cluster_index(K);
+	process_cluster_index[current_min_distance_idx] = 1;
+	MPI_Reduce(process_cluster_index.data(), cluster_cnts.data(), K,
 		   MPI_INT, MPI_SUM, MPI_ROOT_RANK, MPI_COMM_WORLD);
 	
+	// Similarly, sum of the value vectors produces vector of summed numbers in each cluster
+	std::vector<int> process_cluster_value(K);
+	process_cluster_value[current_min_distance_idx] = n_to_classify;
+	MPI_Reduce(process_cluster_value.data(), cluster_sums.data(), K,
+		   MPI_INT, MPI_SUM, MPI_ROOT_RANK, MPI_COMM_WORLD);
+	
+	// Calculate new centers and decide if the current state is the final and the while loop should terminate
 	if (current_process_rank == MPI_ROOT_RANK) {
-	    
-	    // TODO: REMOVE DEBUG OUTPUT
-	    /*
-	    std::cout << "ROOT: Cluster indexes for the input are: ";
-	    for (auto i : cluster_indexes) {
-		std::cout << i << " ";
-	    }
-	    std::cout << std::endl;
-	    */
-	    
-	    // Represents the total number of numbers assigned to each cluster
-	    std::vector<int> cluster_contents_cnt(K);
-	    std::fill(cluster_contents_cnt.begin(), cluster_contents_cnt.end(), 0);
-	    
-	    // Represents the sums of numbers assigned to each cluster
-	    std::vector<int> cluster_contents_sums(K);
-	    std::fill(cluster_contents_sums.begin(), cluster_contents_sums.end(), 0);
-
-	    // Calculate the new centers
-	    for (int i = 0; i < program_input.size(); i++) {
-		cluster_contents_sums[cluster_indexes[i]] += program_input[i];
-		cluster_contents_cnt[cluster_indexes[i]]++; 
-	    }
-	    
 	    end = true;
 	    for (int i = 0; i < K; i++) {
 		double old_kmeans_center = kmeans_centers[i];
-		if (cluster_contents_cnt[i] != 0) {
-		    kmeans_centers[i] = double(cluster_contents_sums[i]) / double(cluster_contents_cnt[i]);
+		if (cluster_cnts[i] != 0) {
+		    kmeans_centers[i] = double(cluster_sums[i]) / double(cluster_cnts[i]);
 		}
 		end = end && (kmeans_centers[i] == old_kmeans_center);
 	    }
 	}
 
 	MPI_Bcast(&end, 1, MPI_CXX_BOOL, MPI_ROOT_RANK, MPI_COMM_WORLD);
+		
     }
-
+    
+    // Gather the cluster indexes for each number in the rank order
+    MPI_Gather(&current_min_distance_idx, 1, MPI_INT,
+	       cluster_indexes.data(), 1, MPI_INT, 
+	       MPI_ROOT_RANK, MPI_COMM_WORLD);
+    
+    // Output the numbers for each cluster
     if (current_process_rank == MPI_ROOT_RANK) {
 	for (int cluster = 0; cluster < K; cluster++) {
 	    bool first_num = true;
